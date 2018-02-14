@@ -1,0 +1,12 @@
+[Desktop Entry]
+Encoding=UTF-8
+Name=Northern
+Comment=Northern P2P Cryptocurrency
+Comment[fr]=Northern, monnaie virtuelle cryptographique pair à pair
+Comment[tr]=Northern, eşten eşe kriptografik sanal para birimi
+Exec=northern-qt %u
+Terminal=false
+Type=Application
+Icon=northern128
+MimeType=x-scheme-handler/northern;
+Categories=Office;Finance;
