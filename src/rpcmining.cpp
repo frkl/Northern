@@ -39,15 +39,6 @@ using namespace std;
 #include "uint256.h"
 typedef map<uint256, pair<CBlock*, CScript> > mapNewBlock_t;
 extern CWallet* pwalletMain;
-struct bitblock
-{
-  int nVersion;
-  uint256 hashPrevBlock;
-  uint256 hashMerkleRoot;
-  unsigned int nTime;
-  unsigned int nBits;
-  unsigned int nNonce;
-};
 inline uint32_t ByteReverse(uint32_t value)
 {
     value = ((value & 0xFF00FF00) >> 8) | ((value & 0x00FF00FF) << 8);
@@ -235,9 +226,11 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
   LogPrintf("generated %s\n", FormatMoney(pblock->vtx[0].vout[0].nValue));
   // Found a solution
   {
-    LOCK(cs_main); 
+    LOCK(cs_main);
     if (pblock->hashPrevBlock != chainActive.Tip()->GetBlockHash())
     return error("Wallet mining : generated block is stale");
+    // Remove key from key pool
+    reservekey.KeepKey();
     // Track how many getdata requests this block gets
     {
       LOCK(wallet.cs_wallet);
@@ -279,46 +272,58 @@ Value getwork(const Array& params, bool fHelp)
     if (IsInitialBlockDownload())
         throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD, "This wallet is downloading blocks...");
 
-	// Update block
-	static unsigned int nTransactionsUpdatedLast;
-	static CBlockIndex* pindexPrev;
-	static int64_t nStart;
-	static CBlockTemplate* pblocktemplate;
+    static mapNewBlock_t mapNewBlock;    // FIXME: thread safety
+    static vector<CBlockTemplate*> vNewBlockTemplate;
+
     if (params.size() == 0)
     {
+        // Update block
+        static unsigned int nTransactionsUpdatedLast;
+        static CBlockIndex* pindexPrev;
+        static int64_t nStart;
+        static CBlockTemplate* pblocktemplate;
         if (pindexPrev != chainActive.Tip() ||
-            (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - nStart > 5))
+            (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - nStart > 60))
         {
+            if (pindexPrev != chainActive.Tip())
+            {
+                // Deallocate old blocks since they're obsolete now
+                mapNewBlock.clear();
+                for (std::vector<CBlockTemplate*>::size_type i=0;i!=vNewBlockTemplate.size();i++)
+				{
+                    delete vNewBlockTemplate[i];
+				}
+                vNewBlockTemplate.clear();
+            }
+
             // Clear pindexPrev so future getworks make a new block, despite any failures from here on
             pindexPrev = NULL;
 
             // Store the pindexBest used before CreateNewBlock, to avoid races
             nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
             CBlockIndex* pindexPrevNew = chainActive.Tip();
-			nStart = GetTime();
-				
-			// Create new block
-			if (pblocktemplate) {
-				delete pblocktemplate;
-				pblocktemplate = NULL;
-			}
+            nStart = GetTime();
 			
 			pblocktemplate=CreateNewBlock(scriptPubKey, pwalletMain, false);
             if (!pblocktemplate)
                 throw JSONRPCError(RPC_OUT_OF_MEMORY, "Out of memory");
-			
+            vNewBlockTemplate.push_back(pblocktemplate);
+            // Need to update only after we know CreateNewBlock succeeded
             pindexPrev = pindexPrevNew;
         }
-        CBlock* pblock = &(pblocktemplate->block); // pointer for convenience
+        CBlock* pblock = &(vNewBlockTemplate.back()->block); // pointer for convenience
 
         // Update nTime
-        UpdateTime(pblock,  pindexPrev);
-        pblock->nNonce=0;
+        UpdateTime(pblock, pindexPrev);
+        pblock->nNonce = 0;
 
         // Update nExtraNonce
-		LOCK(cs_main);
+            LOCK(cs_main);
         static unsigned int nExtraNonce = 0;
         IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+
+        // Save
+        mapNewBlock[pblock->hashMerkleRoot] = make_pair(pblock, pblock->vtx[0].vin[0].scriptSig);
 
         // Pre-build hash buffers
         char pmidstate[32];
@@ -326,7 +331,6 @@ Value getwork(const Array& params, bool fHelp)
         char phash1[64];
         FormatHashBuffers(pblock, pmidstate, pdata, phash1);
         uint256 hashTarget = uint256().SetCompact(pblock->nBits);
-		LogPrintf("Sending work %s, target %s\n",HexStr(BEGIN(pdata), END(pdata)),HexStr(BEGIN(hashTarget), END(hashTarget)));
 
         Object result;
         result.push_back(Pair("midstate", HexStr(BEGIN(pmidstate), END(pmidstate)))); // deprecated
@@ -338,26 +342,30 @@ Value getwork(const Array& params, bool fHelp)
     else
     {
 		
-		CBlock* pblock = &(pblocktemplate->block);
         // Parse parameters
         vector<unsigned char> vchData = ParseHex(params[0].get_str());
-		LogPrintf("Received work %s:\n",params[0].get_str().c_str());
         if (vchData.size() != 128)
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter");
-        unsigned int* pdata = (unsigned int*)&vchData[0];
+        CBlock* pdata = (CBlock*)&vchData[0];
+		
+		
         // Byte reverse
         for (int i = 0; i < 128/4; i++)
-            pdata[i] = ByteReverse(pdata[i]);
+            ((unsigned int*)pdata)[i] = ByteReverse(((unsigned int*)pdata)[i]);
 		
-        pblock->nTime = ((struct bitblock*)pdata)->nTime;
-        pblock->nNonce = ((struct bitblock*)pdata)->nNonce;
+        // Get saved block
+        if (!mapNewBlock.count(pdata->hashMerkleRoot))
+            return false;
+        CBlock* pblock = mapNewBlock[pdata->hashMerkleRoot].first;
+        pblock->nTime = pdata->nTime;
+        pblock->nNonce = pdata->nNonce;
 	CMutableTransaction txCoinbase(pblock->vtx[0]);
 	txCoinbase.vin[0].scriptSig = mapNewBlock[pdata->hashMerkleRoot].second;
         pblock->vtx[0] = txCoinbase;
         pblock->hashMerkleRoot = pblock->BuildMerkleTree();
         //CMutableTransaction txCoinbase(*pblock->vtx[0]);
         //txCoinbase.vin[0].scriptSig = mapNewBlock[pdata->hashMerkleRoot].second;
-	//pblock->vtx[0] = MakeTransactionRef(std::move(txCoinbase));
+		//pblock->vtx[0] = MakeTransactionRef(std::move(txCoinbase));
         assert(pwalletMain != NULL);
         return CheckWork(pblock, *pwalletMain, *pMiningKey);
     }
