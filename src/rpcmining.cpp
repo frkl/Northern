@@ -229,8 +229,6 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
     LOCK(cs_main);
     if (pblock->hashPrevBlock != chainActive.Tip()->GetBlockHash())
     return error("Wallet mining : generated block is stale");
-    // Remove key from key pool
-    reservekey.KeepKey();
     // Track how many getdata requests this block gets
     {
       LOCK(wallet.cs_wallet);
